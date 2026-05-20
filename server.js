@@ -1,465 +1,467 @@
 /**
- * EsnafAjan — Backend
- * Ödeme: Lemon Squeezy
- * Video:  Evolink / Seedance 2.0
- * Müzik:  Epidemic Sound
+ * EsnafAjan Backend
+ * Pipeline 1: Google Yorum → Claude → ElevenLabs → Seedance → FFmpeg → MP4
+ * Pipeline 2: Fotoğraf → Seedance → FFmpeg → MP4 (Reels)
  */
 
-import express    from 'express'
-import multer     from 'multer'
-import crypto     from 'crypto'
-import { Queue, Worker }                                    from 'bullmq'
-import { createClient }                                     from 'redis'
-import { S3Client, PutObjectCommand, GetObjectCommand }     from '@aws-sdk/client-s3'
-import { getSignedUrl }                                     from '@aws-sdk/s3-request-presigner'
-import ffmpeg     from 'fluent-ffmpeg'
-import fetch      from 'node-fetch'
-import FormData   from 'form-data'
-import fs         from 'fs'
+import express from 'express'
+import multer  from 'multer'
+import crypto  from 'crypto'
+import { createClient } from 'redis'
+import fetch   from 'node-fetch'
+import ffmpeg  from 'fluent-ffmpeg'
+import fs      from 'fs'
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const config = {
-  port: parseInt(process.env.PORT || '3000'),
-
-  lemonSqueezy: {
-    webhookSecret: process.env.LS_WEBHOOK_SECRET,
-    variants: {
-      '15s': process.env.LS_VARIANT_15S,
-      '30s': process.env.LS_VARIANT_30S,
+const C = {
+  port:       parseInt(process.env.PORT || '3000'),
+  backendUrl: process.env.BACKEND_URL || 'https://esnafajan-backend-production.up.railway.app',
+  anthropic:  { apiKey: process.env.ANTHROPIC_API_KEY },
+  elevenlabs: {
+    apiKey: process.env.ELEVENLABS_API_KEY,
+    voices: {
+      kadin:      'SAz9YHcvj6GT2YYXdXww',
+      gencErkek:  'FYPltOzsM2n1UbqzX19d',
+      yasliErkek: 'WRjHw9UKGmcRAoOgyIzT',
     },
-    checkoutBase: process.env.LS_CHECKOUT_BASE,
   },
-
   evolink: {
-    baseUrl: process.env.EVOLINK_BASE_URL || 'https://api.evolink.ai',
     apiKey:  process.env.EVOLINK_API_KEY,
+    baseUrl: 'https://api.evolink.ai',
   },
-
-  epidemicSound: {
-    baseUrl: 'https://api.epidemicsound.com',
-    apiKey:  process.env.EPIDEMIC_SOUND_API_KEY,
+  ls: {
+    secret:      process.env.LS_WEBHOOK_SECRET,
+    checkoutBase: process.env.LS_CHECKOUT_BASE,
+    variants: {
+      // Google Yorum paketleri
+      yorum_tek: process.env.LS_YORUM_TEK,   // 150 ₺
+      yorum_uc:  process.env.LS_YORUM_UC,    // 399 ₺
+      yorum_on:  process.env.LS_YORUM_ON,    // 999 ₺
+      // Reels paketleri
+      reels_15s: process.env.LS_REELS_15S,   // 499 ₺
+      reels_30s: process.env.LS_REELS_30S,   // 799 ₺
+    },
   },
-
-  s3: {
-    bucket: process.env.S3_BUCKET  || 'esnafajan-media',
-    region: process.env.AWS_REGION || 'eu-central-1',
-  },
-
   redis: { url: process.env.REDIS_URL || 'redis://localhost:6379' },
-
-  session: { ttlSeconds: 60 * 60 * 2 },
-
-  plans: {
-    '15s': { durationSec: 15 },
-    '30s': { durationSec: 30 },
-  },
 }
 
 // ─── Redis ────────────────────────────────────────────────────────────────────
 
-const redis = createClient({ url: config.redis.url })
+const redis = createClient({ url: C.redis.url })
 await redis.connect()
+console.log('[Redis] ✓')
 
 async function saveSession(id, data) {
-  await redis.setEx(`session:${id}`, config.session.ttlSeconds, JSON.stringify(data))
+  await redis.setEx(`sess:${id}`, 7200, JSON.stringify(data))
 }
 async function getSession(id) {
-  const raw = await redis.get(`session:${id}`)
-  return raw ? JSON.parse(raw) : null
+  const r = await redis.get(`sess:${id}`)
+  return r ? JSON.parse(r) : null
 }
-async function updateSession(id, patch) {
+async function patch(id, data) {
   const s = await getSession(id)
-  if (!s) throw new Error(`Session bulunamadı: ${id}`)
-  await saveSession(id, { ...s, ...patch })
-}
-
-// ─── S3 ───────────────────────────────────────────────────────────────────────
-
-const s3 = new S3Client({ region: config.s3.region })
-
-async function uploadToS3(buffer, key, contentType = 'image/jpeg') {
-  await s3.send(new PutObjectCommand({
-    Bucket: config.s3.bucket, Key: key, Body: buffer, ContentType: contentType,
-  }))
-  return `https://${config.s3.bucket}.s3.${config.s3.region}.amazonaws.com/${key}`
-}
-
-async function getPresignedUrl(key) {
-  return getSignedUrl(
-    s3,
-    new GetObjectCommand({ Bucket: config.s3.bucket, Key: key }),
-    { expiresIn: 86400 }
-  )
+  if (s) await saveSession(id, { ...s, ...data })
 }
 
 // ─── Lemon Squeezy ────────────────────────────────────────────────────────────
 
-function buildCheckoutUrl(plan, sessionId) {
-  const variantId = config.lemonSqueezy.variants[plan]
-  if (!variantId) throw new Error(`LS variant ayarlanmamış: ${plan}`)
-  const params = new URLSearchParams({
+function checkoutUrl(variant, sessionId, tip) {
+  const vid = C.ls.variants[variant]
+  if (!vid) throw new Error(`LS variant eksik: ${variant}`)
+  const p = new URLSearchParams({
     'checkout[custom][session_id]': sessionId,
-    'checkout[custom][plan]': plan,
+    'checkout[custom][tip]': tip,
   })
-  return `${config.lemonSqueezy.checkoutBase}/${variantId}?${params}`
+  return `${C.ls.checkoutBase}/${vid}?${p}`
 }
 
-function verifyLsSignature(rawBody, signature) {
-  const expected = crypto
-    .createHmac('sha256', config.lemonSqueezy.webhookSecret)
-    .update(rawBody)
-    .digest('hex')
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature))
+function verifySig(body, sig) {
+  const exp = crypto.createHmac('sha256', C.ls.secret).update(body).digest('hex')
+  return crypto.timingSafeEqual(Buffer.from(exp), Buffer.from(sig))
 }
 
-// ─── Evolink / Seedance 2.0 ───────────────────────────────────────────────────
+// ─── Claude: Yorum Temizle ────────────────────────────────────────────────────
 
-async function uploadImageToEvolink(buffer, filename) {
-  const form = new FormData()
-  form.append('file', buffer, { filename, contentType: 'image/jpeg' })
-  const res = await fetch(`${config.evolink.baseUrl}/v1/files/upload`, {
+async function temizleYorum(yorum, isletme) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${config.evolink.apiKey}`, ...form.getHeaders() },
-    body: form,
+    headers: {
+      'x-api-key': C.anthropic.apiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      messages: [{
+        role: 'user',
+        content: `Google yorumunu işletme sahibi ağzından, videoda okunacak şekilde düzenle.
+Kurallar: emoji yok, max 3 cümle, işletme sahipliği dili ("ekibimiz", "lezzetlerimiz"), sadece metni yaz.
+${isletme ? `İşletme: ${isletme}` : ''}
+Yorum: ${yorum}`,
+      }],
+    }),
   })
-  if (!res.ok) throw new Error(`Evolink upload hata: ${res.status} ${await res.text()}`)
-  return (await res.json()).url
+  if (!res.ok) throw new Error(`Claude hata: ${res.status}`)
+  const d = await res.json()
+  return d.content[0].text.trim()
 }
 
-async function generateVideoWithSeedance(referenceUrl, contentUrls, durationSec, prompt) {
-  const clips = []
-  const callCount = durationSec / 15
+// ─── ElevenLabs: TTS ─────────────────────────────────────────────────────────
 
-  for (let i = 0; i < callCount; i++) {
-    const imageUrl = i === 0 ? referenceUrl : (contentUrls[i] ?? contentUrls.at(-1))
-    const res = await fetch(`${config.evolink.baseUrl}/v1/video/generate`, {
+async function tts(metin, sesId) {
+  const voiceId = C.elevenlabs.voices[sesId] || C.elevenlabs.voices.kadin
+  const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+    method: 'POST',
+    headers: { 'xi-api-key': C.elevenlabs.apiKey, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      text: metin,
+      model_id: 'eleven_multilingual_v2',
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+    }),
+  })
+  if (!res.ok) throw new Error(`ElevenLabs hata: ${res.status}`)
+  return Buffer.from(await res.arrayBuffer())
+}
+
+async function sesSuresi(mp3Buf) {
+  const p = tmp('probe', 'mp3')
+  fs.writeFileSync(p, mp3Buf)
+  return new Promise((ok, err) => {
+    ffmpeg.ffprobe(p, (e, m) => { tryDel(p); e ? err(e) : ok(Math.ceil(m.format.duration)) })
+  })
+}
+
+// ─── Seedance: Video Üret ─────────────────────────────────────────────────────
+
+async function seedance(photos, sureSn, promptText) {
+  const clipSn  = 5
+  const adet    = Math.ceil(sureSn / clipSn)
+  const clips   = []
+  const ref     = `data:image/jpeg;base64,${photos[0]}`
+
+  for (let i = 0; i < adet; i++) {
+    const img = `data:image/jpeg;base64,${photos[i % photos.length]}`
+    console.log(`[Seedance] ${i + 1}/${adet}`)
+    const res = await fetch(`${C.evolink.baseUrl}/v1/videos/generations`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${config.evolink.apiKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Authorization': `Bearer ${C.evolink.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'seedance-v2',
-        image_url: imageUrl,
-        reference_image_url: referenceUrl,
-        duration: 15,
+        model: 'seedance-2.0-fast-reference-to-video',
+        prompt: promptText || 'Cinematic atmosphere, smooth slow camera, warm professional lighting',
+        image_urls: [img],
+        video_urls: [ref],
+        duration: clipSn,
+        quality: '720p',
         aspect_ratio: '9:16',
-        quality: 'high',
-        prompt: prompt || 'Cinematic restaurant reel, smooth camera movement, warm lighting',
+        generate_audio: false,
       }),
     })
-    if (!res.ok) throw new Error(`Seedance hata: ${res.status} ${await res.text()}`)
-    const task = await res.json()
-    clips.push(await pollVideoTask(task.task_id))
+    if (!res.ok) throw new Error(`Seedance ${res.status}: ${await res.text()}`)
+    const t = await res.json()
+    clips.push(await pollTask(t.id))
   }
 
-  if (clips.length === 1) return { type: 'url', value: clips[0] }
-  return { type: 'buffer', value: await mergeVideoClips(clips) }
+  return clips.length === 1 ? await indirBuf(clips[0]) : await birlestir(clips, sureSn)
 }
 
-async function pollVideoTask(taskId, maxMs = 4 * 60 * 1000) {
+async function pollTask(id, maxMs = 6 * 60 * 1000) {
   const deadline = Date.now() + maxMs
   while (Date.now() < deadline) {
-    const res  = await fetch(`${config.evolink.baseUrl}/v1/video/tasks/${taskId}`, {
-      headers: { 'Authorization': `Bearer ${config.evolink.apiKey}` },
+    await sleep(7000)
+    const r = await fetch(`${C.evolink.baseUrl}/v1/videos/generations/${id}`, {
+      headers: { 'Authorization': `Bearer ${C.evolink.apiKey}` }
     })
-    const data = await res.json()
-    if (data.status === 'completed') return data.video_url
-    if (data.status === 'failed')    throw new Error(`Task başarısız: ${data.error}`)
-    await sleep(5000)
+    if (!r.ok) continue
+    const d = await r.json()
+    console.log(`[Poll] ${id}: ${d.status}`)
+    if (d.status === 'succeeded' || d.status === 'completed') {
+      return d.video_url || d.output?.url || d.result?.url
+    }
+    if (d.status === 'failed' || d.status === 'error') throw new Error(`Task başarısız: ${d.error}`)
   }
-  throw new Error('Video üretimi zaman aşımı')
+  throw new Error('Zaman aşımı')
 }
 
-// ─── FFmpeg ───────────────────────────────────────────────────────────────────
+async function indirBuf(url) {
+  const r = await fetch(url)
+  if (!r.ok) throw new Error(`İndirme hata: ${r.status}`)
+  return Buffer.from(await r.arrayBuffer())
+}
 
-async function mergeVideoClips(urls) {
-  const clips  = []
-  const list   = tmp('list', 'txt')
-  const output = tmp('merged')
-
+async function birlestir(urls, sureSn) {
+  const dosyalar = []
+  const liste    = tmp('liste', 'txt')
+  const cikti    = tmp('birlesik')
   for (const url of urls) {
     const p = tmp('clip')
-    fs.writeFileSync(p, Buffer.from(await (await fetch(url)).arrayBuffer()))
-    clips.push(p)
+    fs.writeFileSync(p, await indirBuf(url))
+    dosyalar.push(p)
   }
-  fs.writeFileSync(list, clips.map(f => `file '${f}'`).join('\n'))
-
-  await ffmpegRun(cmd => cmd
-    .input(list).inputOptions(['-f', 'concat', '-safe', '0'])
-    .outputOptions(['-c', 'copy'])
-    .output(output))
-
-  const buf = fs.readFileSync(output)
-  ;[...clips, list, output].forEach(tryUnlink)
+  fs.writeFileSync(liste, dosyalar.map(f => `file '${f}'`).join('\n'))
+  await ffRun(c => c
+    .input(liste).inputOptions(['-f', 'concat', '-safe', '0'])
+    .outputOptions(['-c:v', 'libx264', '-t', String(sureSn), '-y'])
+    .output(cikti))
+  const buf = fs.readFileSync(cikti)
+  ;[...dosyalar, liste, cikti].forEach(tryDel)
   return buf
 }
 
-async function addMusicToVideo(videoSource, musicTrackId, durationSec) {
-  const videoPath  = tmp('video')
-  const musicPath  = tmp('music', 'mp3')
-  const outputPath = tmp('final')
+// ─── FFmpeg: Final Video ──────────────────────────────────────────────────────
 
-  const mRes = await fetch(
-    `${config.epidemicSound.baseUrl}/v1/tracks/${musicTrackId}/download`,
-    { headers: { 'Authorization': `Bearer ${config.epidemicSound.apiKey}` } }
-  )
-  if (!mRes.ok) throw new Error(`Müzik indirme hata: ${mRes.status}`)
-  fs.writeFileSync(musicPath, Buffer.from(await mRes.arrayBuffer()))
+async function finalYorum(videoBuf, sesBuf, sureSn) {
+  const vp = tmp('vid'); const sp = tmp('ses', 'mp3'); const op = tmp('out')
+  fs.writeFileSync(vp, videoBuf)
+  fs.writeFileSync(sp, sesBuf)
 
-  if (Buffer.isBuffer(videoSource)) {
-    fs.writeFileSync(videoPath, videoSource)
-  } else {
-    fs.writeFileSync(videoPath, Buffer.from(await (await fetch(videoSource)).arrayBuffer()))
-  }
+  await ffRun(c => c
+    .input(vp).input(sp)
+    .complexFilter([
+      `[0:v]loop=-1:1,trim=duration=${sureSn + 1},setpts=PTS-STARTPTS,` +
+      `drawtext=text='📢 EsnafAjan':fontsize=16:fontcolor=white:` +
+      `x=w-tw-15:y=15:shadowcolor=black@0.8:shadowx=1:shadowy=1[out]`,
+    ], 'out')
+    .outputOptions(['-map', '[out]', '-map', '1:a', '-c:v', 'libx264', '-c:a', 'aac', '-shortest', `-t`, String(sureSn + 1), '-y'])
+    .output(op))
 
-  await ffmpegRun(cmd => cmd
-    .input(videoPath).input(musicPath)
-    .outputOptions([
-      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
-      '-map', '0:v:0', '-map', '1:a:0', '-shortest', '-t', String(durationSec),
-    ])
-    .output(outputPath))
-
-  const buf = fs.readFileSync(outputPath)
-  ;[videoPath, musicPath, outputPath].forEach(tryUnlink)
+  const buf = fs.readFileSync(op)
+  ;[vp, sp, op].forEach(tryDel)
   return buf
 }
 
-function ffmpegRun(configure) {
-  return new Promise((resolve, reject) => {
-    configure(ffmpeg()).on('end', resolve).on('error', reject).run()
-  })
+async function finalReels(videoBuf, sureSn) {
+  const vp = tmp('vid'); const op = tmp('out')
+  fs.writeFileSync(vp, videoBuf)
+
+  await ffRun(c => c
+    .input(vp)
+    .complexFilter([
+      `[0:v]loop=-1:1,trim=duration=${sureSn},setpts=PTS-STARTPTS,` +
+      `drawtext=text='📢 EsnafAjan':fontsize=16:fontcolor=white:` +
+      `x=w-tw-15:y=15:shadowcolor=black@0.8:shadowx=1:shadowy=1[out]`,
+    ], 'out')
+    .outputOptions(['-map', '[out]', '-c:v', 'libx264', '-t', String(sureSn), '-y'])
+    .output(op))
+
+  const buf = fs.readFileSync(op)
+  ;[vp, op].forEach(tryDel)
+  return buf
 }
 
-// ─── BullMQ Worker ────────────────────────────────────────────────────────────
+// ─── Pipeline 1: Google Yorum ─────────────────────────────────────────────────
 
-const reelQueue = new Queue('reel-generation', {
-  connection: { url: config.redis.url },
-})
+async function yorumPipeline(sessionId) {
+  const s = await getSession(sessionId)
+  if (!s) return
 
-new Worker('reel-generation', async (job) => {
-  const { sessionId } = job.data
-  const session = await getSession(sessionId)
-  if (!session) throw new Error(`Session bulunamadı: ${sessionId}`)
+  try {
+    await patch(sessionId, { status: 'processing', progress: 5, asama: 'Yorum düzenleniyor...' })
+    const metin = await temizleYorum(s.yorum, s.isletme)
+    console.log(`[Claude] ${metin}`)
 
-  const { plan, photoKeys, musicTrackId, prompt } = session
-  const { durationSec } = config.plans[plan]
+    await patch(sessionId, { progress: 20, asama: 'Ses üretiliyor...', temizMetin: metin })
+    const sesBuf = await tts(metin, s.sesSecimi)
+    const sureSn = await sesSuresi(sesBuf)
+    console.log(`[ElevenLabs] ${sureSn}sn`)
 
-  const progress = async (p) => {
-    await job.updateProgress(p)
-    await updateSession(sessionId, { progress: p, status: p < 100 ? 'processing' : 'completed' })
+    await patch(sessionId, { progress: 35, asama: 'Video üretiliyor...' })
+    const vidBuf = await seedance(s.photos, sureSn, s.prompt)
+
+    await patch(sessionId, { progress: 85, asama: 'Video tamamlanıyor...' })
+    const final = await finalYorum(vidBuf, sesBuf, sureSn)
+
+    const token = crypto.randomBytes(20).toString('hex')
+    await redis.setEx(`dl:${token}`, 86400, final.toString('base64'))
+
+    await patch(sessionId, {
+      status: 'completed', progress: 100,
+      downloadUrl: `${C.backendUrl}/api/download/${token}`,
+      completedAt: new Date().toISOString(),
+    })
+    console.log(`[Yorum] ✓ ${sessionId}`)
+  } catch (e) {
+    console.error(`[Yorum] ✗`, e.message)
+    await patch(sessionId, { status: 'failed', error: e.message })
   }
+}
 
-  await progress(5)
-  console.log(`[Job ${job.id}] ${sessionId} | ${plan}`)
+// ─── Pipeline 2: Reels ────────────────────────────────────────────────────────
 
-  // 1. S3 → Evolink
-  const evolinkUrls = []
-  for (const key of photoKeys) {
-    const url = `https://${config.s3.bucket}.s3.${config.s3.region}.amazonaws.com/${key}`
-    const buf = Buffer.from(await (await fetch(url)).arrayBuffer())
-    evolinkUrls.push(await uploadImageToEvolink(buf, key.split('/').pop()))
+async function reelsPipeline(sessionId) {
+  const s = await getSession(sessionId)
+  if (!s) return
+
+  try {
+    await patch(sessionId, { status: 'processing', progress: 10, asama: 'Video üretiliyor...' })
+    const sureSn = s.plan === 'reels_30s' ? 30 : 15
+    const vidBuf = await seedance(s.photos, sureSn, s.prompt)
+
+    await patch(sessionId, { progress: 85, asama: 'Video tamamlanıyor...' })
+    const final = await finalReels(vidBuf, sureSn)
+
+    const token = crypto.randomBytes(20).toString('hex')
+    await redis.setEx(`dl:${token}`, 86400, final.toString('base64'))
+
+    await patch(sessionId, {
+      status: 'completed', progress: 100,
+      downloadUrl: `${C.backendUrl}/api/download/${token}`,
+      completedAt: new Date().toISOString(),
+    })
+    console.log(`[Reels] ✓ ${sessionId}`)
+  } catch (e) {
+    console.error(`[Reels] ✗`, e.message)
+    await patch(sessionId, { status: 'failed', error: e.message })
   }
-  await progress(20)
-
-  // 2. Video üret
-  const [refUrl, ...contentUrls] = evolinkUrls
-  const videoResult = await generateVideoWithSeedance(refUrl, contentUrls, durationSec, prompt)
-  await progress(70)
-
-  // 3. Müzik ekle
-  const finalBuf = await addMusicToVideo(videoResult.value, musicTrackId, durationSec)
-  await progress(90)
-
-  // 4. S3'e yükle
-  const outputKey = `reels/${sessionId}/final.mp4`
-  await uploadToS3(finalBuf, outputKey, 'video/mp4')
-  const downloadUrl = await getPresignedUrl(outputKey)
-
-  await updateSession(sessionId, {
-    status: 'completed', progress: 100,
-    outputKey, downloadUrl,
-    completedAt: new Date().toISOString(),
-  })
-  await progress(100)
-  return { downloadUrl }
-
-}, {
-  connection: { url: config.redis.url },
-  concurrency: 3,
-}).on('failed', async (job, err) => {
-  console.error(`[Job ${job?.id}] Hata:`, err.message)
-  if (job?.data?.sessionId) {
-    await updateSession(job.data.sessionId, { status: 'failed', error: err.message }).catch(() => {})
-  }
-})
+}
 
 // ─── Express ──────────────────────────────────────────────────────────────────
 
 const app = express()
 app.use('/api/webhook', express.raw({ type: 'application/json' }))
-app.use(express.json({ limit: '1mb' }))
-
-// CORS — Vercel frontend'inden istek gelecek
-app.use((req, res, next) => {
+app.use(express.json({ limit: '20mb' }))
+app.use((_, res, next) => {
   res.header('Access-Control-Allow-Origin', '*')
   res.header('Access-Control-Allow-Headers', 'Content-Type')
   res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-  if (req.method === 'OPTIONS') return res.sendStatus(200)
   next()
 })
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024, files: 5 },
-  fileFilter: (_, file, cb) => cb(null, file.mimetype.startsWith('image/')),
+  limits: { fileSize: 10 * 1024 * 1024, files: 5 },
+  fileFilter: (_, f, cb) => cb(null, f.mimetype.startsWith('image/')),
 })
 
-// ── POST /api/session ─────────────────────────────────────────────────────────
-app.post('/api/session', upload.array('photos', 5), async (req, res) => {
+// POST /api/session/yorum
+app.post('/api/session/yorum', upload.array('photos', 5), async (req, res) => {
   try {
-    const { plan, musicTrackId, prompt } = req.body
-    const files = req.files
+    const { yorum, sesSecimi, isletme, paket, prompt } = req.body
+    if (!req.files?.length)           return res.status(400).json({ error: 'En az 1 fotoğraf gerekli' })
+    if (!yorum || yorum.length < 10)  return res.status(400).json({ error: 'Yorum çok kısa' })
+    if (!sesSecimi)                   return res.status(400).json({ error: 'Ses seçimi zorunlu' })
 
-    if (!config.plans[plan])
-      return res.status(400).json({ error: 'Geçersiz plan. "15s" veya "30s" olmalı.' })
-    if (!files || files.length < 2)
-      return res.status(400).json({ error: 'En az 2 fotoğraf gerekli.' })
-    if (!musicTrackId)
-      return res.status(400).json({ error: 'Müzik seçimi zorunlu.' })
+    const id     = `sess_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+    const variant = paket || 'yorum_tek'
 
-    const sessionId = `sess_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
-
-    const photoKeys = []
-    for (let i = 0; i < files.length; i++) {
-      const ext = files[i].originalname.split('.').pop() || 'jpg'
-      const key = `sessions/${sessionId}/photo_${i}.${ext}`
-      await uploadToS3(files[i].buffer, key, files[i].mimetype)
-      photoKeys.push(key)
-    }
-
-    await saveSession(sessionId, {
-      sessionId, plan, photoKeys, musicTrackId,
-      prompt: prompt || '',
-      status: 'pending_payment',
-      progress: 0,
+    await saveSession(id, {
+      id, tip: 'yorum', variant,
+      photos:    req.files.map(f => f.buffer.toString('base64')),
+      yorum, sesSecimi,
+      isletme:   isletme || '',
+      prompt:    prompt || '',
+      status:    'pending_payment', progress: 0,
       createdAt: new Date().toISOString(),
     })
 
-    const checkoutUrl = buildCheckoutUrl(plan, sessionId)
-    console.log(`[Session] ${sessionId} | ${plan} | ${files.length} fotoğraf`)
-
-    res.json({ sessionId, checkoutUrl, expiresIn: config.session.ttlSeconds })
-  } catch (err) {
-    console.error('[/api/session]', err)
-    res.status(500).json({ error: err.message })
+    res.json({ sessionId: id, checkoutUrl: checkoutUrl(variant, id, 'yorum') })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
   }
 })
 
-// ── POST /api/webhook/ls ──────────────────────────────────────────────────────
+// POST /api/session/reels
+app.post('/api/session/reels', upload.array('photos', 5), async (req, res) => {
+  try {
+    const { plan, musicTrackId, prompt } = req.body
+    if (!req.files || req.files.length < 2) return res.status(400).json({ error: 'En az 2 fotoğraf gerekli' })
+
+    const id      = `sess_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`
+    const variant = plan || 'reels_15s'
+
+    await saveSession(id, {
+      id, tip: 'reels', variant, plan: variant,
+      photos:    req.files.map(f => f.buffer.toString('base64')),
+      musicTrackId: musicTrackId || '',
+      prompt:    prompt || '',
+      status:    'pending_payment', progress: 0,
+      createdAt: new Date().toISOString(),
+    })
+
+    res.json({ sessionId: id, checkoutUrl: checkoutUrl(variant, id, 'reels') })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// POST /api/webhook/ls
 app.post('/api/webhook/ls', async (req, res) => {
   try {
-    const signature = req.headers['x-signature']
-    if (!signature) return res.status(401).json({ error: 'İmza eksik' })
-    if (!verifyLsSignature(req.body, signature))
-      return res.status(401).json({ error: 'Geçersiz imza' })
+    const sig = req.headers['x-signature']
+    if (!sig || !verifySig(req.body, sig)) return res.status(401).json({ error: 'İmza geçersiz' })
 
-    const payload   = JSON.parse(req.body.toString())
-    const eventName = payload.meta?.event_name
+    const payload = JSON.parse(req.body.toString())
+    if (payload.meta?.event_name !== 'order_created') return res.json({ ok: true, skip: true })
+    if (payload.data?.attributes?.status !== 'paid')  return res.json({ ok: true, skip: true })
 
-    if (eventName !== 'order_created') return res.json({ received: true, skipped: true })
+    const custom    = payload.meta?.custom_data || {}
+    const sessionId = custom.session_id
+    const tip       = custom.tip
 
-    const order = payload.data
-    if (order?.attributes?.status !== 'paid') return res.json({ received: true, skipped: true })
+    if (!sessionId) return res.status(400).json({ error: 'session_id yok' })
 
-    const customData = payload.meta?.custom_data || {}
-    const sessionId  = customData.session_id
+    const s = await getSession(sessionId)
+    if (!s) return res.status(404).json({ error: 'Session yok' })
+    if (s.status !== 'pending_payment') return res.json({ ok: true, duplicate: true })
 
-    if (!sessionId) {
-      console.error('[Webhook] session_id yok:', customData)
-      return res.status(400).json({ error: 'session_id eksik' })
-    }
+    await patch(sessionId, { status: 'queued', paidAt: new Date().toISOString() })
 
-    const session = await getSession(sessionId)
-    if (!session) return res.status(404).json({ error: 'Session bulunamadı' })
+    // Pipeline'ı başlat
+    if (tip === 'yorum') yorumPipeline(sessionId)
+    else reelsPipeline(sessionId)
 
-    if (session.status !== 'pending_payment') {
-      return res.json({ received: true, duplicate: true })
-    }
-
-    await updateSession(sessionId, {
-      status: 'queued',
-      lsOrderId: order?.id,
-      paidAt: new Date().toISOString(),
-    })
-
-    const job = await reelQueue.add(
-      'generate-reel',
-      { sessionId },
-      {
-        attempts: 2,
-        backoff: { type: 'exponential', delay: 15000 },
-        jobId: `reel-${sessionId}`,
-      }
-    )
-
-    console.log(`[Webhook] Order ${order?.id} → Session ${sessionId} → Job ${job.id}`)
-    res.json({ received: true, jobId: job.id })
-  } catch (err) {
-    console.error('[Webhook]', err)
-    res.status(500).json({ error: 'Webhook işlenemedi' })
+    res.json({ ok: true })
+  } catch (e) {
+    console.error('[Webhook]', e)
+    res.status(500).json({ error: 'Webhook hatası' })
   }
 })
 
-// ── GET /api/session/:id ──────────────────────────────────────────────────────
-app.get('/api/session/:sessionId', async (req, res) => {
+// GET /api/session/:id
+app.get('/api/session/:id', async (req, res) => {
   try {
-    const session = await getSession(req.params.sessionId)
-    if (!session) return res.status(404).json({ error: 'Session bulunamadı' })
-    const { status, progress, downloadUrl, error } = session
-    res.json({ status, progress, downloadUrl, error })
-  } catch (err) {
-    res.status(500).json({ error: 'Durum alınamadı' })
-  }
+    const s = await getSession(req.params.id)
+    if (!s) return res.status(404).json({ error: 'Bulunamadı' })
+    res.json({ status: s.status, progress: s.progress, asama: s.asama, downloadUrl: s.downloadUrl, temizMetin: s.temizMetin, error: s.error })
+  } catch { res.status(500).json({ error: 'Hata' }) }
 })
 
-// ── GET /api/music/trending ───────────────────────────────────────────────────
-app.get('/api/music/trending', async (req, res) => {
+// GET /api/download/:token
+app.get('/api/download/:token', async (req, res) => {
   try {
-    const r    = await fetch(
-      `${config.epidemicSound.baseUrl}/v1/tracks?tags=trending,upbeat&limit=24`,
-      { headers: { 'Authorization': `Bearer ${config.epidemicSound.apiKey}` } }
-    )
-    const data = await r.json()
-    res.json({
-      tracks: (data.results || []).map(t => ({
-        id:          t.id,
-        title:       t.title,
-        artist:      t.artist?.name,
-        durationSec: t.length,
-        bpm:         t.bpm,
-        previewUrl:  t.stems?.find(s => s.type === 'full')?.lqMp3Url,
-        coverUrl:    t.coverArt?.original,
-      })),
-    })
-  } catch (err) {
-    res.status(500).json({ error: 'Müzik listesi alınamadı' })
-  }
+    const b64 = await redis.get(`dl:${req.params.token}`)
+    if (!b64) return res.status(404).json({ error: 'Link geçersiz' })
+    const buf = Buffer.from(b64, 'base64')
+    res.set({ 'Content-Type': 'video/mp4', 'Content-Disposition': 'attachment; filename="esnafajan.mp4"', 'Content-Length': buf.length })
+    res.send(buf)
+  } catch { res.status(500).json({ error: 'Hata' }) }
 })
 
-// ── Sağlık kontrolü ───────────────────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ status: 'ok' }))
+// GET /api/music
+app.get('/api/music', (_, res) => res.json({ tracks: [
+  { id: 'demo-1', title: 'Upbeat Morning',  artist: 'EsnafAjan', bpm: 120 },
+  { id: 'demo-2', title: 'City Vibes',      artist: 'EsnafAjan', bpm: 110 },
+  { id: 'demo-3', title: 'Fresh Start',     artist: 'EsnafAjan', bpm: 128 },
+  { id: 'demo-4', title: 'Summer Flavors',  artist: 'EsnafAjan', bpm: 115 },
+  { id: 'demo-5', title: 'Evening Hustle',  artist: 'EsnafAjan', bpm: 105 },
+]}))
 
-app.listen(config.port, () => {
-  console.log(`\nEsnafAjan backend çalışıyor → http://localhost:${config.port}`)
+app.get('/health', (_, res) => res.json({
+  status: 'ok',
+  evolink:    !!C.evolink.apiKey,
+  elevenlabs: !!C.elevenlabs.apiKey,
+  anthropic:  !!C.anthropic.apiKey,
+}))
+
+app.listen(C.port, () => {
+  console.log(`\nEsnafAjan → http://localhost:${C.port}`)
+  console.log(`  Evolink:    ${C.evolink.apiKey    ? '✓' : '✗ EKSİK'}`)
+  console.log(`  ElevenLabs: ${C.elevenlabs.apiKey ? '✓' : '✗ EKSİK'}`)
+  console.log(`  Anthropic:  ${C.anthropic.apiKey  ? '✓' : '✗ EKSİK'}`)
 })
 
-// ─── Yardımcılar ──────────────────────────────────────────────────────────────
-
-function tmp(name, ext = 'mp4') {
-  return `/tmp/${name}_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`
-}
-function tryUnlink(p) { try { fs.unlinkSync(p) } catch {} }
+function tmp(n, e = 'mp4') { return `/tmp/ea_${n}_${Date.now()}_${Math.random().toString(36).slice(2)}.${e}` }
+function tryDel(p) { try { fs.unlinkSync(p) } catch {} }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
+function ffRun(cfg) { return new Promise((ok, err) => cfg(ffmpeg()).on('end', ok).on('error', err).run()) }
